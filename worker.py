@@ -32,8 +32,10 @@ PREP_LOG = Path("/root/prep.log")
 
 
 def network_sealed():
-    """Structural check first (only loopback exists), then probes as a second opinion."""
-    if sorted(os.listdir("/sys/class/net")) != ["lo"]:
+    """Structural check first (only loopback exists), then probes as a second opinion.
+    if_nameindex() asks the kernel about this process's own network namespace; /sys/class/net
+    would still show the host's interfaces unless sysfs were remounted."""
+    if sorted(name for _, name in socket.if_nameindex()) != ["lo"]:
         return False
     for fam, addr in ((socket.AF_INET, ("1.1.1.1", 443)), (socket.AF_INET, ("8.8.8.8", 53)),
                       (socket.AF_INET6, ("2606:4700:4700::1111", 443))):
