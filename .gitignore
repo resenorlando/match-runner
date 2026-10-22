@@ -1,0 +1,12 @@
+*
+!.gitignore
+!.gitattributes
+!README.md
+!seal.py
+!worker.py
+!crypto.lock
+!.github/
+!.github/workflows/
+!.github/workflows/batch.yml
+!jobs/
+!jobs/*.enc

@@ -1,0 +1,105 @@
+name: batch
+run-name: batch ${{ inputs.request_id }}
+
+# Manual trigger only: nobody without write access can start it, and it never runs for pull requests.
+on:
+  workflow_dispatch:
+    inputs:
+      request_id:
+        description: "16 hex chars"
+        required: true
+        type: string
+      shards:
+        description: "number of parallel jobs (1-20)"
+        required: true
+        type: number
+        default: 20
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      shards: ${{ steps.p.outputs.shards }}
+    steps:
+      - id: p
+        env:
+          RID: ${{ inputs.request_id }}
+          N: ${{ inputs.shards }}
+        run: |
+          python3 - <<'EOF'
+          import json, os, re, sys
+          rid, n = os.environ["RID"], os.environ["N"]
+          if not re.fullmatch(r"[0-9a-f]{16}", rid) or not re.fullmatch(r"[0-9]{1,2}", n) or not 1 <= int(n) <= 20:
+              sys.exit("bad inputs")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write("shards=" + json.dumps(list(range(int(n)))) + "\n")
+          EOF
+
+  run:
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.shards) }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /seal.py
+            /worker.py
+            /crypto.lock
+            /jobs/${{ inputs.request_id }}.enc
+
+      # Jobs run as `w`: an ordinary user with no sudo rights, separate from the runner user.
+      - name: Install
+        run: |
+          sudo useradd --create-home --shell /usr/sbin/nologin w
+          sudo python3 -m venv /opt/w
+          sudo /opt/w/bin/pip install --quiet --disable-pip-version-check --no-deps \
+            --require-hashes --only-binary=:all: -r crypto.lock
+
+      # Network on, job not decrypted yet. Tool setup comes from a repository secret and runs with
+      # all output in a root-only file (it is added to the encrypted result). Then every `w`
+      # process is killed so nothing started here survives into the sealed step.
+      - name: Prepare
+        env:
+          PREP: ${{ secrets.PREP }}
+        run: |
+          printf '%s' "$PREP" | (umask 077 && sudo tee /root/prep.sh > /dev/null)
+          if sudo bash -c 'bash /root/prep.sh > /root/prep.log 2>&1 && touch /root/prep.ok'; then echo "prepared"; else echo "prepare failed"; fi
+          sudo rm -f /root/prep.sh
+          sudo pkill -KILL -u w || true
+          sleep 1
+          if pgrep -u w > /dev/null; then echo "processes still running"; exit 1; fi
+
+      # Sealed: new network namespace (loopback only), new mount namespace with empty private
+      # /run, /tmp and /dev/shm (no host sockets such as DNS or D-Bus), new PID namespace (cannot
+      # see or signal host processes; everything dies when the supervisor exits).
+      # worker.py refuses to read the key unless only loopback exists.
+      - name: Run (no network)
+        env:
+          JOB_KEY: ${{ secrets[format('K_{0}', inputs.request_id)] }}
+          RID: ${{ inputs.request_id }}
+          SHARD: ${{ matrix.shard }}
+        run: |
+          sudo --preserve-env=JOB_KEY,RID,SHARD,GITHUB_WORKSPACE \
+            unshare --net --mount --pid --fork --mount-proc --propagation private -- \
+            sh -c 'mount -t tmpfs -o mode=755 tmpfs /run && mount -t tmpfs -o mode=1777 tmpfs /tmp && mount -t tmpfs -o mode=1777 tmpfs /dev/shm && ip link set lo up && exec /opt/w/bin/python "$GITHUB_WORKSPACE/worker.py"'
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always() && hashFiles('result/res.enc') != ''
+        with:
+          name: res-${{ inputs.request_id }}-${{ matrix.shard }}
+          path: result/res.enc
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
